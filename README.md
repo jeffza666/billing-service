@@ -1,279 +1,257 @@
 # Hospital Billing Service
 
-A billing microservice developed as part of a team-based hospital management project.
+This service records medicine bills for a hospital system. It exposes a REST API to create a bill, mark it paid, or cancel it, stores each bill in MySQL with Spring Data JPA, and publishes payment and prescription messages to Kafka when a bill is paid.
 
-This repository contains the **billing component only**, rather than the complete hospital system. It provides REST APIs for medicine bills and publishes payment and prescription messages through Kafka for integration with other services.
+The pharmacy service that would consume those messages is not in this repository. Nothing in this service charges a card or calls a payment gateway. "Pay" updates the stored bill and emits Kafka messages.
 
-## My Contribution
-
-My work focused on the billing backend:
-
-- Implementing REST APIs for creating, retrieving, paying, and cancelling bills.
-- Calculating bill totals using `BigDecimal`.
-- Persisting billing records with Spring Data JPA and MySQL.
-- Publishing payment and prescription messages through Kafka.
-
-## Tech Stack
+## Tech stack
 
 | Area | Technology |
 | --- | --- |
-| Language | Java 17 |
+| Language | Java 17 (`java.version` in `pom.xml`) |
 | Framework | Spring Boot 3.1.0 |
-| REST API | Spring Web |
-| Persistence | Spring Data JPA, MySQL |
-| Messaging | Spring Kafka, Apache Kafka |
-| Build tool | Maven Wrapper |
+| HTTP API | Spring Web |
+| Persistence | Spring Data JPA, Hibernate, MySQL (`com.mysql.cj.jdbc.Driver`, `MySQL8Dialect`) |
+| Messaging | Spring Kafka |
+| Build | Maven Wrapper (`mvnw`, Maven 3.9.9) |
 
-## Implemented Features
+The Maven wrapper script in git is not marked executable. On Linux and macOS, run it with `bash ./mvnw`. On Windows, use `mvnw.cmd`.
 
-### Bill Creation
+## What a bill contains
 
-Create a bill containing patient details, medicine details, quantity, and price per unit.
+Bills are stored in the `billings` table. Each record has:
 
-The service calculates the total:
+- `id` — generated database identity
+- `patientId`, `patientName`
+- `medicineId`, `medicineName`
+- `quantity` (integer)
+- `pricePerUnit` and `totalAmount` (`BigDecimal`)
+- `status` — `PENDING`, `PAID`, or `CANCELLED`
+- `billingDate` — set when the bill is created
+- `paymentDate` — set when the bill is marked paid; otherwise null
 
-```text
-totalAmount = pricePerUnit × quantity
+There is no bean validation on the request. A create call that cannot be saved returns HTTP 500 with an empty body.
+
+### Create
+
+`POST /api/billing` saves a new bill:
+
+- `totalAmount` is `pricePerUnit` multiplied by `quantity`, using `BigDecimal`.
+- `status` is `PENDING`.
+- `billingDate` is the current local date-time.
+- No Kafka message is sent.
+
+The response is HTTP 201 and the saved bill.
+
+### Pay
+
+`POST /api/billing/{id}/pay` takes no body.
+
+- Unknown id: HTTP 404 and an empty body.
+- Status is already `PAID`: HTTP 200 and the existing bill. No Kafka messages are sent.
+- Any other status, including `CANCELLED`: status becomes `PAID`, `paymentDate` is set to now, the row is saved, then one message is sent to `payment-topic` and one to `prescription-topic`. The response is HTTP 200 and the saved bill.
+
+`paymentStatus` on the payment message is always `true`. The prescription message carries the bill's patient, medicine, and quantity.
+
+`KafkaTemplate.send` is asynchronous. The send calls sit in the same `@Transactional` method as the database update, and this project does not configure a Kafka transaction or an outbox. A successful HTTP response means the bill row was saved. Delivery to the broker is separate.
+
+### Cancel
+
+`POST /api/billing/{id}/cancel` takes no body.
+
+- Unknown id: HTTP 404 and an empty body.
+- Status is `PAID`: HTTP 400 and an empty body. The row is left unchanged.
+- Any other status, including an already `CANCELLED` bill: status is set to `CANCELLED` and the row is saved. The response is HTTP 200. No Kafka message is sent.
+
+## REST API
+
+Base path: `/api/billing`. The server port is Spring Boot's default, `8080`, unless you set `SERVER_PORT`.
+
+| Method | Path | Success | Other results |
+| --- | --- | --- | --- |
+| POST | `/api/billing` | 201, created bill | 500 empty body |
+| POST | `/api/billing/{id}/pay` | 200, paid bill | 404 unknown id, 500 empty body |
+| POST | `/api/billing/{id}/cancel` | 200, cancelled bill | 404 unknown id, 400 if the bill is `PAID`, 500 empty body |
+| GET | `/api/billing` | 200, every bill | |
+| GET | `/api/billing/{id}` | 200, one bill | 404 if that id does not exist |
+| GET | `/api/billing/patient/{patientId}` | 200, bills for that patient (possibly empty) | |
+| GET | `/api/billing/status/{status}` | 200, bills with that status | 400 if `status` is not a status name |
+
+`{status}` is matched case-insensitively to `PENDING`, `PAID`, or `CANCELLED`.
+
+### Create a bill
+
+```bash
+curl -s -X POST http://localhost:8080/api/billing \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "patientId": "DEMO-P001",
+    "patientName": "Demo Patient",
+    "medicineId": "DEMO-M001",
+    "medicineName": "Demo Medicine",
+    "quantity": 2,
+    "pricePerUnit": 25.50
+  }'
 ```
 
-Monetary calculations use Java `BigDecimal`. Newly created bills have the status `PENDING`.
+Request fields are `patientId`, `patientName`, `medicineId`, `medicineName`, `quantity`, and `pricePerUnit`. With those numbers, `totalAmount` is `51.00` and `status` is `PENDING`. `id`, `billingDate`, and `paymentDate` are produced by the service (`paymentDate` is null until the bill is paid).
 
-### Bill Retrieval
+### Pay a bill
 
-Retrieve:
+Use the `id` returned at create time. This call has no request body.
 
-- All bills.
-- A bill by its ID.
-- Bills belonging to a patient.
-- Bills filtered by status.
-
-### Payment Processing
-
-The payment endpoint:
-
-1. Finds the requested bill.
-2. Updates its status to `PAID`.
-3. Records the payment timestamp.
-4. Publishes payment and prescription messages to Kafka.
-
-Calling the endpoint again for an already-paid bill returns the existing bill without publishing those messages again.
-
-This endpoint records payment status within the project. It does not charge a card or connect to a real payment gateway.
-
-### Bill Cancellation
-
-Cancel a bill that has not been paid.
-
-The service rejects cancellation of a bill with the status `PAID`.
-
-## Service Integration
-
-```text
-API Client
-    |
-    v
-Billing REST API
-    |
-    v
-Billing Service ------> MySQL
-    |
-    v
-Kafka
-    |
-    +---- payment-topic
-    |
-    +---- prescription-topic
+```bash
+curl -s -X POST http://localhost:8080/api/billing/1/pay
 ```
 
-The Kafka messages support integration with the project's pharmacy workflow. Downstream services are outside this repository.
+### Cancel a bill
 
-## API Endpoints
+This call has no request body. Cancel before pay if you need the bill to stay unpaid. A bill that is already `PAID` is rejected.
 
-Base path: `/api/billing`
+```bash
+curl -s -X POST http://localhost:8080/api/billing/1/cancel
+```
 
-| Method | Endpoint | Description |
+### Read bills
+
+```bash
+curl -s http://localhost:8080/api/billing
+curl -s http://localhost:8080/api/billing/1
+curl -s http://localhost:8080/api/billing/patient/DEMO-P001
+curl -s http://localhost:8080/api/billing/status/PENDING
+```
+
+## Kafka
+
+Producer settings:
+
+- Bootstrap servers come from `KAFKA_BOOTSTRAP_SERVERS` (default `kafka:29092`).
+- Message keys use `StringSerializer`. This service calls `send` with the topic and value only, so the record key is null.
+- Message values use Spring's `JsonSerializer`.
+
+On startup the application declares these topics with 1 partition and replication factor 1:
+
+| Topic property | Default topic name | When a message is sent |
 | --- | --- | --- |
-| POST | `/api/billing` | Create a bill |
-| GET | `/api/billing` | Retrieve all bills |
-| GET | `/api/billing/{id}` | Retrieve a bill by ID |
-| GET | `/api/billing/patient/{patientId}` | Retrieve bills for a patient |
-| GET | `/api/billing/status/{status}` | Retrieve bills by status |
-| POST | `/api/billing/{id}/pay` | Mark a bill as paid and publish messages |
-| POST | `/api/billing/{id}/cancel` | Cancel an unpaid bill |
+| `kafka.topic.payment` | `payment-topic` | A bill is marked paid, and it was not already `PAID` |
+| `kafka.topic.prescription` | `prescription-topic` | Same moment as the payment message |
 
-Supported statuses:
-
-```text
-PENDING
-PAID
-CANCELLED
-```
-
-## Example Request
-
-Send a `POST` request to `/api/billing` with the header:
-
-```text
-Content-Type: application/json
-```
-
-Example body using fictional data:
+`payment-topic` value:
 
 ```json
 {
   "patientId": "DEMO-P001",
   "patientName": "Demo Patient",
-  "medicineId": "DEMO-M001",
-  "medicineName": "Demo Medicine",
-  "quantity": 2,
-  "pricePerUnit": 25.50
+  "paymentStatus": true
 }
 ```
 
-The calculated total is `51.00`, and the initial status is `PENDING`.
+`prescription-topic` value:
 
-Use the bill ID returned by the API for subsequent requests:
-
-```text
-GET  /api/billing/{id}
-POST /api/billing/{id}/pay
-POST /api/billing/{id}/cancel
+```json
+{
+  "patientId": "DEMO-P001",
+  "medicineId": "DEMO-M001",
+  "medicineName": "Demo Medicine",
+  "quantity": 2
+}
 ```
 
-The payment and cancellation endpoints do not require a request body.
+If the broker cannot be contacted while topics are declared, that failure is logged. The admin client in this service is left at its default, which does not abort startup solely because topic creation failed. The cluster describe call waits up to 30 seconds, so an unreachable broker can delay startup by that long. Hibernate still needs MySQL at startup because `spring.jpa.hibernate.ddl-auto` is `update`.
 
-## Running Locally
+## Environment variables
 
-### Requirements
+`src/main/resources/application.properties` reads connection settings from the process environment. The application does not load a `.env` file on its own. Export the variables in the shell, or use another mechanism that injects them into the process environment, before you start the JVM.
 
-- JDK 17.
-- A running MySQL server.
-- A running Kafka broker.
-- A development database and database credentials.
+| Variable | Property | Default when unset |
+| --- | --- | --- |
+| `DB_URL` | `spring.datasource.url` | `jdbc:mysql://mysql:3306/billingdb` |
+| `DB_USERNAME` | `spring.datasource.username` | `billinguser` |
+| `DB_PASSWORD` | `spring.datasource.password` | empty |
+| `KAFKA_BOOTSTRAP_SERVERS` | `spring.kafka.bootstrap-servers` | `kafka:29092` |
 
-The Maven Wrapper is included. MySQL and Kafka must be provided separately; this repository does not include a Docker Compose setup for them.
+The defaults for the JDBC URL, database user, and Kafka host are the same connection targets the service used before. `DB_PASSWORD` has an empty default. Set it to the password of your own database user.
 
-### 1. Clone the Repository
+`.env.example` lists those names and has no values. Copy it to `.env`, which is gitignored, and fill in local values there:
 
 ```bash
-git clone https://github.com/jeffza666/Billing-Service.git
-cd Billing-Service
+cp .env.example .env
 ```
 
-### 2. Create a Development Database
+`.env` is for your machine. Do not commit it.
 
-Using a MySQL account with permission to create databases:
+Example of exporting values for a database and broker on the same machine. Replace the password with the one you configured in MySQL:
+
+```bash
+export DB_URL='jdbc:mysql://localhost:3306/billingdb'
+export DB_USERNAME='billinguser'
+export DB_PASSWORD='your-database-password'
+export KAFKA_BOOTSTRAP_SERVERS='localhost:9092'
+```
+
+`SERVER_PORT` is a normal Spring Boot setting if you need a port other than 8080. It is not referenced by `application.properties`.
+
+The hostnames `mysql` and `kafka` are the built-in defaults. They resolve on a Docker network that uses those service names. A process started directly on your machine needs the `localhost` values above (or whatever host and port your MySQL and Kafka actually use). Kafka's listener port inside a container is often `29092`; a broker published on the host is often `9092`. Use the address your client can reach.
+
+## Running locally
+
+This repository does not include Docker Compose. Run MySQL and Kafka yourself, then start the service.
+
+You need:
+
+- JDK 17
+- A MySQL server
+- A Kafka broker
+- The Maven wrapper (no separate Maven install)
+
+Create the database named by `DB_URL`. With the default URL that name is `billingdb`. Create a MySQL user that matches `DB_USERNAME` and set `DB_PASSWORD` to that user's password. Grant that user access to `billingdb`.
 
 ```sql
-CREATE DATABASE billing_demo;
+CREATE DATABASE billingdb;
 ```
 
-### 3. Configure the Service
+Hibernate creates or updates the `billings` table on startup (`ddl-auto=update`).
 
-Configuration is defined in:
+Make sure the broker will accept the topics `payment-topic` and `prescription-topic`, or allow the application's admin client to create them (1 partition, replication factor 1).
 
-```text
-src/main/resources/application.properties
-```
-
-You can override connection settings with environment variables.
-
-For example, in PowerShell:
-
-```powershell
-$env:SPRING_DATASOURCE_URL = "jdbc:mysql://localhost:3306/billing_demo"
-$env:SPRING_DATASOURCE_USERNAME = "YOUR_DEV_DB_USER"
-$env:SPRING_DATASOURCE_PASSWORD = "YOUR_DEV_DB_PASSWORD"
-$env:SPRING_KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
-$env:SERVER_PORT = "8080"
-```
-
-Replace the example values with your development settings.
-
-The repository's Kafka address, `kafka:29092`, requires a network where the hostname `kafka` resolves. Override it with your broker's reachable address when running locally.
-
-Ensure these topics exist, or enable automatic topic creation on your development broker:
-
-```text
-payment-topic
-prescription-topic
-```
-
-The current JPA configuration uses `ddl-auto=update` to create or update database tables.
-
-### 4. Start the Application
-
-Windows PowerShell:
-
-```powershell
-.\mvnw.cmd spring-boot:run
-```
-
-macOS/Linux:
+Load your environment variables, then start the service from the repository root:
 
 ```bash
-./mvnw spring-boot:run
+set -a
+. ./.env
+set +a
+bash ./mvnw spring-boot:run
 ```
 
-With the example port setting, the API is available at:
+Windows (`mvnw.cmd`), after setting the same variables in that shell:
 
-```text
-http://localhost:8080/api/billing
+```bat
+mvnw.cmd spring-boot:run
 ```
 
-## Project Structure
+The API is then at `http://localhost:8080/api/billing` when the port is 8080.
+
+## Tests
+
+```bash
+bash ./mvnw test
+```
+
+`BillingServiceApplicationTests` loads the application context. The test points at `BillingServiceApplication` and replaces the database with in-memory H2 and the broker with Spring's embedded Kafka. It does not use your `DB_PASSWORD` or a running MySQL or Kafka.
+
+## Project layout
 
 ```text
 src/main/java/com/hospital/billing/
-├── controller/    # REST endpoints
-├── dto/           # Request and Kafka message objects
-├── kafka/         # Kafka message producer
-├── model/         # Billing entity and status enum
-├── repository/    # Database access
-└── service/       # Billing calculations and workflow
-
-src/main/resources/
-└── application.properties
+├── BillingServiceApplication.java
+├── config/KafkaConfig.java          # producer, admin client, topic declarations
+├── controller/BillingController.java
+├── dto/                             # create request and Kafka message bodies
+├── kafka/KafkaProducer.java
+├── model/                           # Billing entity and BillingStatus
+├── repository/BillingRepository.java
+└── service/BillingService.java
+src/main/resources/application.properties
+src/test/java/com/example/billing_service/BillingServiceApplicationTests.java
+.env.example
 ```
-
-## Verification
-
-Test sources are included in the repository. To run the available tests:
-
-Windows:
-
-```powershell
-.\mvnw.cmd test
-```
-
-macOS/Linux:
-
-```bash
-./mvnw test
-```
-
-Tests that load the application context may require database and Kafka configuration.
-
-For manual API verification:
-
-1. Create a bill and check its calculated total and `PENDING` status.
-2. Retrieve it by ID and patient ID.
-3. Mark it as paid and check its status and payment timestamp.
-4. Inspect the payment and prescription messages in Kafka.
-5. Repeat the payment request and check that no additional messages are published.
-6. Create another bill and cancel it.
-7. Confirm that cancelling a paid bill is rejected.
-
-## Scope and Further Improvements
-
-This repository represents one service within a coursework system. The complete hospital application, its user interface, and downstream services are maintained outside this repository.
-
-Potential improvements include:
-
-- Stronger request validation.
-- Consistent API error responses.
-- Stricter billing status-transition rules.
-- Integration tests covering database and Kafka behavior.
-- Reliable coordination between database updates and Kafka publication, such as a transactional outbox.
-
-The current implementation does not guarantee atomic database updates and Kafka delivery.

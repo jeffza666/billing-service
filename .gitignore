@@ -31,3 +31,9 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Local environment (may contain secrets) ###
+.env
+.env.*
+!.env.example
+
